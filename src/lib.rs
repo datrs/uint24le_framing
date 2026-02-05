@@ -16,4 +16,4 @@ mod duplex;
 mod framing;
 mod util;
 
-pub use framing::Uint24LELengthPrefixedFraming;
+pub use framing::{FramedWithErrors, Uint24LELengthPrefixedFraming};
