@@ -86,7 +86,12 @@ where
             *last_data_idx,
             to_stream.len() - *last_data_idx
         );
+        let mut saw_eof = false;
         let n_bytes_read = match Pin::new(io).poll_read(cx, &mut to_stream[*last_data_idx..]) {
+            Poll::Ready(Ok(0)) => {
+                saw_eof = true;
+                0
+            }
             Poll::Ready(Ok(n)) => n,
             Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e))),
             Poll::Pending => 0,
@@ -104,17 +109,16 @@ where
             trace!(step = ?*step, "enter");
             let cur_data = &to_stream[*last_out_idx..*last_data_idx];
 
-            let Some((header_len, body_len)) = stat_uint24_le(cur_data) else {
+            if let Some((header_len, body_len)) = stat_uint24_le(cur_data) {
+                let cur_frame_start = *last_out_idx + header_len;
+                let cur_frame_end = (cur_frame_start as u64) + body_len;
+                *step = Step::Body {
+                    start: cur_frame_start,
+                    end: cur_frame_end,
+                };
+            } else {
                 trace!("not enough bytes to read header");
-                return Poll::Pending;
-            };
-
-            let cur_frame_start = *last_out_idx + header_len;
-            let cur_frame_end = (cur_frame_start as u64) + body_len;
-            *step = Step::Body {
-                start: cur_frame_start,
-                end: cur_frame_end,
-            };
+            }
         }
 
         info!(step = ?*step, "enter");
@@ -132,6 +136,18 @@ where
                 return Poll::Ready(Some(Ok(out)));
             } else {
                 trace!("Frame not ready start = {start}, end = {end}");
+            }
+        }
+        if saw_eof {
+            if *last_data_idx == *last_out_idx {
+                // Clean EOF with no pending data
+                return Poll::Ready(None);
+            } else {
+                // EOF with incomplete message
+                return Poll::Ready(Some(Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "connection closed with incomplete message",
+                ))));
             }
         }
         Poll::Pending
