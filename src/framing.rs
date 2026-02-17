@@ -9,7 +9,7 @@ use std::{
     pin::Pin,
     task::{Context, Poll},
 };
-use tracing::{error, info, instrument, trace, warn};
+use tracing::{debug, error, instrument, trace, warn};
 
 const BUF_SIZE: usize = 1024 * 64;
 const _HEADER_LEN: usize = 3;
@@ -104,12 +104,6 @@ where
             step,
             ..
         } = self.get_mut();
-        trace!(
-            "Try to AsyncRead up to (buff_size[{}] - last_data_idx[{}]) = [{}]",
-            to_stream.len(),
-            *last_data_idx,
-            to_stream.len() - *last_data_idx
-        );
         let mut saw_eof = false;
         let n_bytes_read = match Pin::new(io).poll_read(cx, &mut to_stream[*last_data_idx..]) {
             Poll::Ready(Ok(0)) => {
@@ -120,8 +114,12 @@ where
             Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e))),
             Poll::Pending => 0,
         };
-        // TODO handle if to_stream is full
-        trace!("adding #=[{n_bytes_read}] bytes to end=[{}]", last_data_idx);
+
+        trace!(
+            "adding #=[{n_bytes_read}] bytes to buffe.len() = [{}]. remaining capacity = [{}]",
+            last_data_idx,
+            to_stream.len() - (n_bytes_read + *last_data_idx)
+        );
         *last_data_idx += n_bytes_read;
         // grow buffer if it's full
         if *last_data_idx == to_stream.len() - 1 {
@@ -145,11 +143,11 @@ where
             }
         }
 
-        info!(step = ?*step, "enter");
+        trace!(step = ?*step, "enter");
         if let Step::Body { start, end } = step {
             let end = *end as usize;
             if end <= *last_data_idx {
-                trace!(frame_size = end - *start, "Frame ready");
+                debug!(frame_size = end - *start, "Frame ready");
                 let out = to_stream[*start..end].to_vec();
                 *step = Step::Header;
 
@@ -588,7 +586,7 @@ pub(crate) mod test {
 
     #[tokio::test]
     async fn split_off_errors_error_terminates_stream() -> Result<()> {
-        use std::io::{Error, ErrorKind};
+        use std::io::Error;
 
         // Create a custom reader that errors after some data
         struct ErrorAfterN {
@@ -604,7 +602,7 @@ pub(crate) mod test {
                 buf: &mut [u8],
             ) -> Poll<Result<usize>> {
                 if self.pos >= self.error_at {
-                    return Poll::Ready(Err(Error::new(ErrorKind::Other, "test error")));
+                    return Poll::Ready(Err(Error::other("test error")));
                 }
                 let remaining = self.error_at - self.pos;
                 let to_read = buf.len().min(remaining).min(self.data.len() - self.pos);
