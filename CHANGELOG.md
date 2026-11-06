@@ -11,7 +11,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `Uint24LELengthPrefixedFraming::split_off_errors`, which sends read errors to a separate stream.
+- CI.
+
 ### Changed
+
+### Fixed
+
+- EOF now ends the stream, or is an `UnexpectedEof` error if it arrives part way through a frame.
 
 ### Removed
 
