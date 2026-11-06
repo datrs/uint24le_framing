@@ -57,6 +57,41 @@ where
         }
     }
 
+    /// Remove and return the next frame if all of it has been read into [`Self::to_stream`].
+    fn take_buffered_frame(&mut self) -> Option<Vec<u8>> {
+        if let Step::Header = self.step {
+            let cur_data = &self.to_stream[self.last_out_idx..self.last_data_idx];
+            let Some((header_len, body_len)) = stat_uint24_le(cur_data) else {
+                trace!("not enough bytes to read header");
+                return None;
+            };
+            let cur_frame_start = self.last_out_idx + header_len;
+            self.step = Step::Body {
+                start: cur_frame_start,
+                end: (cur_frame_start as u64) + body_len,
+            };
+        }
+
+        let Step::Body { start, end } = self.step else {
+            unreachable!("a header was just parsed");
+        };
+        let end = end as usize;
+        if end > self.last_data_idx {
+            trace!("Frame not ready start = {start}, end = {end}");
+            return None;
+        }
+
+        debug!(frame_size = end - start, "Frame ready");
+        let frame = self.to_stream[start..end].to_vec();
+        self.step = Step::Header;
+
+        // remove bytes we're done with
+        self.to_stream.rotate_left(end);
+        self.last_data_idx -= end;
+        self.last_out_idx = 0;
+        Some(frame)
+    }
+
     /// Split off errors into a separate stream.
     ///
     /// Returns a tuple of:
@@ -96,84 +131,45 @@ where
 
     #[instrument(skip_all)]
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let Self {
-            io,
-            to_stream,
-            last_out_idx,
-            last_data_idx,
-            step,
-            ..
-        } = self.get_mut();
-        let mut saw_eof = false;
-        let n_bytes_read = match Pin::new(io).poll_read(cx, &mut to_stream[*last_data_idx..]) {
-            Poll::Ready(Ok(0)) => {
-                saw_eof = true;
-                0
+        let this = self.get_mut();
+        // Read until a frame is ready or `poll_read` is `Pending`. Stopping any sooner would
+        // return `Pending` without the IO holding our waker, and nothing would poll us again.
+        loop {
+            if let Some(frame) = this.take_buffered_frame() {
+                return Poll::Ready(Some(Ok(frame)));
             }
-            Poll::Ready(Ok(n)) => n,
-            Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e))),
-            Poll::Pending => 0,
-        };
 
-        trace!(
-            "adding #=[{n_bytes_read}] bytes to buffe.len() = [{}]. remaining capacity = [{}]",
-            last_data_idx,
-            to_stream.len() - (n_bytes_read + *last_data_idx)
-        );
-        *last_data_idx += n_bytes_read;
-        // grow buffer if it's full
-        if *last_data_idx == to_stream.len() - 1 {
-            warn!("Buffer full, double it's size");
-            to_stream.extend(vec![0; to_stream.len()]);
-        }
+            // A read into an empty slice returns `Ok(0)`, which would look like EOF.
+            if this.last_data_idx == this.to_stream.len() {
+                let doubled_length = this.to_stream.len() * 2;
+                debug!("Read buffer full, growing it to [{doubled_length}] bytes");
+                this.to_stream.resize(doubled_length, 0);
+            }
 
-        if let Step::Header = step {
-            trace!(step = ?*step, "enter");
-            let cur_data = &to_stream[*last_out_idx..*last_data_idx];
-
-            if let Some((header_len, body_len)) = stat_uint24_le(cur_data) {
-                let cur_frame_start = *last_out_idx + header_len;
-                let cur_frame_end = (cur_frame_start as u64) + body_len;
-                *step = Step::Body {
-                    start: cur_frame_start,
-                    end: cur_frame_end,
-                };
-            } else {
-                trace!("not enough bytes to read header");
+            let unfilled = &mut this.to_stream[this.last_data_idx..];
+            match Pin::new(&mut this.io).poll_read(cx, unfilled) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e))),
+                Poll::Ready(Ok(0)) if this.last_data_idx == this.last_out_idx => {
+                    // Clean EOF with no pending data
+                    return Poll::Ready(None);
+                }
+                Poll::Ready(Ok(0)) => {
+                    // EOF with incomplete message
+                    return Poll::Ready(Some(Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "connection closed with incomplete message",
+                    ))));
+                }
+                Poll::Ready(Ok(n_bytes_read)) => {
+                    trace!(
+                        "adding #=[{n_bytes_read}] bytes at [{}]",
+                        this.last_data_idx
+                    );
+                    this.last_data_idx += n_bytes_read;
+                }
             }
         }
-
-        trace!(step = ?*step, "enter");
-        if let Step::Body { start, end } = step {
-            let end = *end as usize;
-            if end <= *last_data_idx {
-                debug!(frame_size = end - *start, "Frame ready");
-                let out = to_stream[*start..end].to_vec();
-                *step = Step::Header;
-
-                // remove bytes we're done with
-                to_stream.rotate_left(end);
-                *last_data_idx -= end;
-                *last_out_idx = 0;
-
-                return Poll::Ready(Some(Ok(out)));
-            } else {
-                trace!("Frame not ready start = {start}, end = {end}");
-            }
-        }
-        if saw_eof {
-            if *last_data_idx == *last_out_idx {
-                // Clean EOF with no pending data
-                return Poll::Ready(None);
-            } else {
-                // EOF with incomplete message
-                return Poll::Ready(Some(Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "connection closed with incomplete message",
-                ))));
-            }
-        }
-        Poll::Pending
     }
 }
 
@@ -312,7 +308,8 @@ pub(crate) mod test {
     use super::*;
     use futures::{FutureExt, SinkExt, StreamExt};
     use futures_lite::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-    use tokio::spawn;
+    use std::time::Duration;
+    use tokio::{spawn, time::timeout};
     use tokio_util::compat::TokioAsyncReadCompatExt;
 
     pub(crate) fn duplex(
@@ -320,6 +317,130 @@ pub(crate) mod test {
     ) -> (impl AsyncRead + AsyncWrite, impl AsyncRead + AsyncWrite) {
         let (left, right) = tokio::io::duplex(channel_size);
         (left.compat(), right.compat())
+    }
+
+    /// Longer than any of these tests should take, so a stall fails instead of hanging.
+    const STALL_TIMEOUT: Duration = Duration::from_secs(5);
+
+    fn patterned_bytes(length: usize) -> Vec<u8> {
+        (0..length).map(|index| (index % 251) as u8).collect()
+    }
+
+    /// Send `frames` from one framed end and collect them at the other.
+    async fn send_and_receive_frames(frames: Vec<Vec<u8>>) -> Result<Vec<Vec<u8>>> {
+        let (left, right) = tokio::io::duplex(4096);
+        let mut sender = Uint24LELengthPrefixedFraming::new(left.compat());
+        let mut receiver = Uint24LELengthPrefixedFraming::new(right.compat());
+        let frame_count = frames.len();
+
+        let send_all = async {
+            for frame in frames {
+                sender.send(frame).await?;
+            }
+            Ok::<(), std::io::Error>(())
+        };
+        let receive_all = async {
+            let mut received = vec![];
+            while received.len() < frame_count {
+                received.push(receiver.next().await.expect("the sender is still open")?);
+            }
+            Ok::<Vec<Vec<u8>>, std::io::Error>(received)
+        };
+
+        let (sent, received) =
+            timeout(STALL_TIMEOUT, async { tokio::join!(send_all, receive_all) })
+                .await
+                .expect("frames stalled");
+        sent?;
+        received
+    }
+
+    /// The sizes either side of where a frame stops fitting the initial read buffer, along with
+    /// its 3 byte header.
+    #[tokio::test]
+    async fn frames_around_the_size_of_the_read_buffer_are_received() -> Result<()> {
+        for frame_length in [
+            BUF_SIZE - 5,
+            BUF_SIZE - 4,
+            BUF_SIZE - 3,
+            BUF_SIZE - 2,
+            BUF_SIZE,
+            BUF_SIZE + 1,
+        ] {
+            let frame = patterned_bytes(frame_length);
+            assert_eq!(
+                send_and_receive_frames(vec![frame.clone()]).await?,
+                [frame],
+                "frame of {frame_length} bytes"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_frame_many_times_the_read_buffer_is_received() -> Result<()> {
+        let frame = patterned_bytes(10 * BUF_SIZE + 1);
+        assert_eq!(send_and_receive_frames(vec![frame.clone()]).await?, [frame]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn frames_after_a_large_frame_are_received_in_order() -> Result<()> {
+        let frames = vec![
+            patterned_bytes(2 * BUF_SIZE),
+            b"small".to_vec(),
+            patterned_bytes(3 * BUF_SIZE),
+            vec![],
+            b"last".to_vec(),
+        ];
+        assert_eq!(send_and_receive_frames(frames.clone()).await?, frames);
+        Ok(())
+    }
+
+    /// Reading the first half consumes a ready read, so the receiver has to go back and poll the
+    /// IO again, or nothing wakes it when the second half arrives. It gets its own task because
+    /// `tokio::join!` re-polls every branch on any wake, which would hide that.
+    #[tokio::test]
+    async fn a_frame_arriving_in_two_writes_is_received() -> Result<()> {
+        let (mut raw_sender, right) = tokio::io::duplex(4096);
+        let mut receiver = Uint24LELengthPrefixedFraming::new(right.compat());
+        let frame = patterned_bytes(100);
+        let wire_bytes = wrap_uint24_le(&frame);
+        let (first_half, second_half) = wire_bytes.split_at(wire_bytes.len() / 2);
+
+        let receiving = spawn(async move { receiver.next().await });
+
+        tokio::io::AsyncWriteExt::write_all(&mut raw_sender, first_half).await?;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::io::AsyncWriteExt::write_all(&mut raw_sender, second_half).await?;
+
+        let received = timeout(STALL_TIMEOUT, receiving)
+            .await
+            .expect("the frame stalled")
+            .expect("the receiving task panicked")
+            .expect("the sender is still open")?;
+        assert_eq!(received, frame);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn eof_part_way_through_a_large_frame_is_an_error() -> Result<()> {
+        let (mut raw_sender, right) = tokio::io::duplex(4 * BUF_SIZE);
+        let mut receiver = Uint24LELengthPrefixedFraming::new(right.compat());
+        let wire_bytes = wrap_uint24_le(&patterned_bytes(3 * BUF_SIZE));
+
+        tokio::io::AsyncWriteExt::write_all(&mut raw_sender, &wire_bytes[..2 * BUF_SIZE]).await?;
+        drop(raw_sender);
+
+        let received = timeout(STALL_TIMEOUT, receiver.next())
+            .await
+            .expect("EOF stalled")
+            .expect("an incomplete frame is reported, not dropped");
+        assert_eq!(
+            received.unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+        Ok(())
     }
 
     #[tokio::test]
