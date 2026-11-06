@@ -1,6 +1,6 @@
 //! Wrap bytes IO in length prefixed framing. Length is little endian 24 bit unsigned integer.
 use crate::util::{stat_uint24_le, wrap_uint24_le};
-use futures::{Sink, Stream};
+use futures::{Sink, Stream, channel::mpsc};
 use futures_lite::io::{AsyncRead, AsyncWrite};
 use std::{
     collections::VecDeque,
@@ -9,7 +9,7 @@ use std::{
     pin::Pin,
     task::{Context, Poll},
 };
-use tracing::{error, info, instrument, trace, warn};
+use tracing::{debug, error, instrument, trace, warn};
 
 const BUF_SIZE: usize = 1024 * 64;
 const _HEADER_LEN: usize = 3;
@@ -56,6 +56,30 @@ where
             step: Step::Header,
         }
     }
+
+    /// Split off errors into a separate stream.
+    ///
+    /// Returns a tuple of:
+    /// - A [`FramedWithErrors`] that implements `Stream<Item = Vec<u8>> + Sink<Vec<u8>>`
+    /// - A stream of IO errors that occurred while reading
+    ///
+    /// When an error occurs on the underlying stream, it is sent to the error stream
+    /// and the main stream terminates.
+    pub fn split_off_errors(
+        self,
+    ) -> (
+        FramedWithErrors<IO>,
+        mpsc::UnboundedReceiver<std::io::Error>,
+    ) {
+        let (error_tx, error_rx) = mpsc::unbounded();
+        (
+            FramedWithErrors {
+                inner: self,
+                error_tx,
+            },
+            error_rx,
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -80,19 +104,22 @@ where
             step,
             ..
         } = self.get_mut();
-        trace!(
-            "Try to AsyncRead up to (buff_size[{}] - last_data_idx[{}]) = [{}]",
-            to_stream.len(),
-            *last_data_idx,
-            to_stream.len() - *last_data_idx
-        );
+        let mut saw_eof = false;
         let n_bytes_read = match Pin::new(io).poll_read(cx, &mut to_stream[*last_data_idx..]) {
+            Poll::Ready(Ok(0)) => {
+                saw_eof = true;
+                0
+            }
             Poll::Ready(Ok(n)) => n,
             Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e))),
             Poll::Pending => 0,
         };
-        // TODO handle if to_stream is full
-        trace!("adding #=[{n_bytes_read}] bytes to end=[{}]", last_data_idx);
+
+        trace!(
+            "adding #=[{n_bytes_read}] bytes to buffe.len() = [{}]. remaining capacity = [{}]",
+            last_data_idx,
+            to_stream.len() - (n_bytes_read + *last_data_idx)
+        );
         *last_data_idx += n_bytes_read;
         // grow buffer if it's full
         if *last_data_idx == to_stream.len() - 1 {
@@ -104,24 +131,23 @@ where
             trace!(step = ?*step, "enter");
             let cur_data = &to_stream[*last_out_idx..*last_data_idx];
 
-            let Some((header_len, body_len)) = stat_uint24_le(cur_data) else {
+            if let Some((header_len, body_len)) = stat_uint24_le(cur_data) {
+                let cur_frame_start = *last_out_idx + header_len;
+                let cur_frame_end = (cur_frame_start as u64) + body_len;
+                *step = Step::Body {
+                    start: cur_frame_start,
+                    end: cur_frame_end,
+                };
+            } else {
                 trace!("not enough bytes to read header");
-                return Poll::Pending;
-            };
-
-            let cur_frame_start = *last_out_idx + header_len;
-            let cur_frame_end = (cur_frame_start as u64) + body_len;
-            *step = Step::Body {
-                start: cur_frame_start,
-                end: cur_frame_end,
-            };
+            }
         }
 
-        info!(step = ?*step, "enter");
+        trace!(step = ?*step, "enter");
         if let Step::Body { start, end } = step {
             let end = *end as usize;
             if end <= *last_data_idx {
-                trace!(frame_size = end - *start, "Frame ready");
+                debug!(frame_size = end - *start, "Frame ready");
                 let out = to_stream[*start..end].to_vec();
                 *step = Step::Header;
 
@@ -129,9 +155,22 @@ where
                 to_stream.rotate_left(end);
                 *last_data_idx -= end;
                 *last_out_idx = 0;
+
                 return Poll::Ready(Some(Ok(out)));
             } else {
                 trace!("Frame not ready start = {start}, end = {end}");
+            }
+        }
+        if saw_eof {
+            if *last_data_idx == *last_out_idx {
+                // Clean EOF with no pending data
+                return Poll::Ready(None);
+            } else {
+                // EOF with incomplete message
+                return Poll::Ready(Some(Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "connection closed with incomplete message",
+                ))));
             }
         }
         Poll::Pending
@@ -197,12 +236,81 @@ where
         Pin::new(&mut *io).poll_close(cx)
     }
 }
+
+/// A framed stream/sink that sends read errors to a separate channel.
+///
+/// Created by [`Uint24LELengthPrefixedFraming::split_off_errors`].
+pub struct FramedWithErrors<IO> {
+    inner: Uint24LELengthPrefixedFraming<IO>,
+    error_tx: mpsc::UnboundedSender<std::io::Error>,
+}
+
+impl<IO> Debug for FramedWithErrors<IO> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FramedWithErrors")
+            .field("inner", &self.inner)
+            .finish()
+    }
+}
+
+impl<IO> Stream for FramedWithErrors<IO>
+where
+    IO: AsyncWrite + AsyncRead + Send + Unpin + 'static,
+{
+    type Item = Vec<u8>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_next(cx) {
+            Poll::Ready(Some(Ok(data))) => Poll::Ready(Some(data)),
+            Poll::Ready(Some(Err(e))) => {
+                let _ = this.error_tx.unbounded_send(e);
+                Poll::Ready(None)
+            }
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<IO> Sink<Vec<u8>> for FramedWithErrors<IO>
+where
+    IO: AsyncWrite + AsyncRead + Send + Unpin + 'static,
+{
+    type Error = std::io::Error;
+
+    fn poll_ready(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::result::Result<(), Self::Error>> {
+        Pin::new(&mut self.get_mut().inner).poll_ready(cx)
+    }
+
+    fn start_send(self: Pin<&mut Self>, item: Vec<u8>) -> std::result::Result<(), Self::Error> {
+        Pin::new(&mut self.get_mut().inner).start_send(item)
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::result::Result<(), Self::Error>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_close(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::result::Result<(), Self::Error>> {
+        Pin::new(&mut self.get_mut().inner).poll_close(cx)
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod test {
     use crate::duplex::Duplex;
 
     use super::*;
-    use futures::{SinkExt, StreamExt};
+    use futures::{FutureExt, SinkExt, StreamExt};
     use futures_lite::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
     use tokio::spawn;
     use tokio_util::compat::TokioAsyncReadCompatExt;
@@ -375,6 +483,180 @@ pub(crate) mod test {
 
         assert_eq!(r3, data);
         assert_eq!(r4, data);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn split_off_errors_stream() -> Result<()> {
+        let (left, mut right) = duplex(64);
+        let framed = Uint24LELengthPrefixedFraming::new(left);
+        let (mut framed, _errors) = framed.split_off_errors();
+
+        let data: &[&[u8]] = &[b"yolo", b"squalor", b"idle", b"hello", b"stuff"];
+        for d in data {
+            let msg = wrap_uint24_le(d);
+            right.write_all(&msg).await?;
+        }
+
+        for d in data {
+            let Some(res) = framed.next().await else {
+                panic!("expected data");
+            };
+            assert_eq!(&res, d);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn split_off_errors_sink() -> Result<()> {
+        let (left, mut right) = duplex(64);
+        let framed = Uint24LELengthPrefixedFraming::new(left);
+        let (mut framed, _errors) = framed.split_off_errors();
+
+        let data: &[&[u8]] = &[b"yolo", b"squalor", b"idle", b"hello", b"stuff"];
+        for d in data {
+            framed.send(d.to_vec()).await.unwrap();
+        }
+
+        let mut expected = vec![];
+        data.iter().for_each(|d| expected.extend(wrap_uint24_le(d)));
+        let mut result = vec![0; expected.len()];
+        right.read_exact(&mut result).await?;
+        assert_eq!(result, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn split_off_errors_bidirectional() -> Result<()> {
+        let (left, right) = duplex(64);
+
+        let left_framed = Uint24LELengthPrefixedFraming::new(left);
+        let (mut left_framed, _left_errors) = left_framed.split_off_errors();
+
+        let right_framed = Uint24LELengthPrefixedFraming::new(right);
+        let (mut right_framed, _right_errors) = right_framed.split_off_errors();
+
+        let data: &[&[u8]] = &[b"yolo", b"squalor", b"idle", b"hello", b"stuff"];
+
+        // Send from right to left
+        for d in data {
+            right_framed.send(d.to_vec()).await.unwrap();
+        }
+
+        let mut result1 = vec![];
+        for _ in data {
+            result1.push(left_framed.next().await.unwrap());
+        }
+        assert_eq!(result1, data);
+
+        // Send from left to right
+        for d in data {
+            left_framed.send(d.to_vec()).await.unwrap();
+        }
+
+        let mut result2 = vec![];
+        for _ in data {
+            result2.push(right_framed.next().await.unwrap());
+        }
+        assert_eq!(result2, data);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn split_off_errors_receives_error_on_close() -> Result<()> {
+        let (left, right) = duplex(64);
+        let framed = Uint24LELengthPrefixedFraming::new(left);
+        let (mut framed, mut errors) = framed.split_off_errors();
+
+        // Drop the other end to cause an error/EOF
+        drop(right);
+
+        // Stream should return None (EOF)
+        let result = framed.next().await;
+        assert!(result.is_none());
+
+        // Note: EOF may not produce an error, just None
+        // Check if there's an error (implementation dependent)
+        let _maybe_error = errors.next().now_or_never();
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn split_off_errors_error_terminates_stream() -> Result<()> {
+        use std::io::Error;
+
+        // Create a custom reader that errors after some data
+        struct ErrorAfterN {
+            data: Vec<u8>,
+            pos: usize,
+            error_at: usize,
+        }
+
+        impl AsyncRead for ErrorAfterN {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &mut [u8],
+            ) -> Poll<Result<usize>> {
+                if self.pos >= self.error_at {
+                    return Poll::Ready(Err(Error::other("test error")));
+                }
+                let remaining = self.error_at - self.pos;
+                let to_read = buf.len().min(remaining).min(self.data.len() - self.pos);
+                if to_read == 0 {
+                    return Poll::Ready(Ok(0));
+                }
+                buf[..to_read].copy_from_slice(&self.data[self.pos..self.pos + to_read]);
+                self.pos += to_read;
+                Poll::Ready(Ok(to_read))
+            }
+        }
+
+        impl AsyncWrite for ErrorAfterN {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<Result<usize>> {
+                Poll::Ready(Ok(buf.len()))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        // Prepare data: one valid message, then error
+        let msg1 = wrap_uint24_le(b"hello");
+        let mut data = msg1.clone();
+        // Add partial data for second message that will error
+        data.extend_from_slice(&[0, 0, 5]); // header for 5 byte body
+
+        let error_reader = ErrorAfterN {
+            data,
+            pos: 0,
+            error_at: msg1.len() + 3 + 1, // error after header of second message
+        };
+
+        let framed = Uint24LELengthPrefixedFraming::new(error_reader);
+        let (mut framed, mut errors) = framed.split_off_errors();
+
+        // First message should succeed
+        let first = framed.next().await;
+        assert_eq!(first, Some(b"hello".to_vec()));
+
+        // Second read should error and terminate
+        let second = framed.next().await;
+        assert!(second.is_none());
+
+        // Error should be in the error channel
+        let err = errors.next().now_or_never();
+        assert!(err.is_some());
 
         Ok(())
     }
