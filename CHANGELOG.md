@@ -19,6 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - EOF now ends the stream, or is an `UnexpectedEof` error if it arrives part way through a frame.
+- Frames that don't fit the 64 KiB read buffer no longer stall the stream.
+- A frame arriving across several reads no longer stalls the stream.
 
 ### Removed
 
