@@ -11,6 +11,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+### Changed
+
+### Removed
+
+
+
+## [0.2.1] - 2026-11-06
+
+### Added
+
 - `Uint24LELengthPrefixedFraming::split_off_errors`, which sends read errors to a separate stream.
 - CI.
 
@@ -49,6 +59,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Removed
 
 <!-- next-url -->
-[Unreleased]: https://github.com/datrs/uint24le_framing/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/datrs/uint24le_framing/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/datrs/uint24le_framing/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/datrs/uint24le_framing/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/datrs/uint24le_framing/compare/v0.1.0...v0.1.0
